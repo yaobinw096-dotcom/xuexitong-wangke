@@ -1,0 +1,19 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>课伴 · 设置</title><link rel="stylesheet" href="ui.css"></head><body><main class="layout">
+<header class="header"><div class="brand"><img src="icons/48.png" alt=""><div><strong>课伴</strong><small>学习通助手</small></div></div><span class="pill">本地扩展 · 0.1.3-alpha.1</span></header>
+<div class="intro"><h1>设置你的学习流程</h1><p>连接自己的 AI，选择播放与答题方式。设置保存后，在课程页面点击开始。</p></div>
+<form id="form"><div class="grid"><section class="card"><div class="step">01 / 答案来源</div><h2>连接 AI 接口</h2><p class="subtitle">支持 OpenAI 兼容的 Chat Completions 接口。</p>
+<div class="field"><label for="apiBase">API 地址</label><input id="apiBase" type="url" placeholder="https://你的服务地址/v1" autocomplete="off"><span class="hint">填写服务商给出的基础地址；也可以填写完整的 /chat/completions 地址。</span></div>
+<div class="field"><label for="apiKey">API 密钥</label><input id="apiKey" type="password" placeholder="填入你自己的密钥" autocomplete="off"><span class="hint">保存在此浏览器的插件本地存储；不会同步到云端。本机无密钥服务可留空。</span></div>
+<div class="field"><label for="model">模型名称</label><input id="model" type="text" placeholder="填写服务商提供的模型 ID" autocomplete="off"></div>
+<div class="footer"><button type="button" id="test">保存并测试连接</button></div></section>
+<section class="card"><div class="step">02 / 自动操作</div><h2>视频与章节测验</h2><p class="subtitle">仅在你点击开始的学习通课程页面运行。</p>
+<div class="row"><label for="rate">播放速度</label><select id="rate"><option value="1">1 倍</option><option value="1.25">1.25 倍</option><option value="1.5">1.5 倍</option><option value="1.75">1.75 倍</option><option value="2">2 倍</option></select></div>
+<div class="row"><label for="muted">视频静音</label><input id="muted" type="checkbox"></div>
+<div class="row"><label for="autoNext">本节完成后切换下一节</label><input id="autoNext" type="checkbox"></div>
+<div class="row"><label for="autoAnswer">自动解答并填写章节测验</label><input id="autoAnswer" type="checkbox"></div>
+<div class="row"><label for="autoSubmit">填写并核对后自动提交</label><input id="autoSubmit" type="checkbox"></div>
+<div class="row"><label for="images">图片题 / 特殊字体截图<br><span class="hint">需要支持图片的模型；课程页需在前台</span></label><input id="images" type="checkbox"></div>
+<p class="note">题干、选项及必要的题目截图会发送到上方 API 地址。普通视频播放不需要 AI；文档或未识别的任务会暂停，等待手动完成。</p></section></div>
+<div class="footer"><button class="primary" type="submit" id="save">保存设置</button><span class="status" id="status" role="status">正在读取设置…</span></div></form>
+<p class="note">请先暂停大学搜题酱等同类插件，避免两个助手同时操作页面。网页结构变化时，课伴会停止并显示原因。</p>
+</main><script src="core.js"></script><script src="options.js"></script></body></html>

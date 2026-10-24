@@ -1,0 +1,24 @@
+name: 问题反馈
+description: 提交脱敏的最小复现
+body:
+  - type: markdown
+    attributes:
+      value: '请勿提交 API 密钥、Cookie、真实账号或未脱敏的页面。'
+  - type: input
+    id: version
+    attributes:
+      label: 扩展版本与浏览器版本
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 操作步骤、预期结果和实际结果
+      description: 说明是否使用章节页、是否存在其他自动操作扩展，以及停止提示。
+    validations:
+      required: true
+  - type: textarea
+    id: fixture
+    attributes:
+      label: 脱敏的最小 HTML 或日志
+      description: 图片题、填空或富文本问题请说明题型；不要贴完整账户页面。
