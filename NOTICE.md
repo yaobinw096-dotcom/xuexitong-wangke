@@ -9,6 +9,7 @@
 - [chaolucky18/xuexitongScript](https://github.com/chaolucky18/xuexitongScript) 与 [sorbte/xuexitong](https://github.com/sorbte/xuexitong)：调试切章时查阅公开页面结构和导航说明，未复制其实现代码。
 - 大学搜题酱 1.17.5：对用户已安装版本进行了静态行为分析，参考任务点标记、正常播放、章节导航及确认弹窗。没有声称“洁净室重写”；私有分析快照和反编译文件未公开。
 - 扩展 API 依据 [Chrome 内容脚本](https://developer.chrome.com/docs/extensions/develop/concepts/content-scripts)、[可选权限](https://developer.chrome.com/docs/extensions/reference/api/permissions)、[存储](https://developer.chrome.com/docs/extensions/reference/api/storage)及 [Edge 本地加载](https://learn.microsoft.com/en-us/microsoft-edge/extensions/getting-started/extension-sideloading)文档。
+- 视频停滞检测查阅 [hls.js 播放停滞文档](https://github.com/video-dev/hls.js/blob/master/docs/API.md)与 [MDN play()](https://developer.mozilla.org/en-US/docs/Web/API/HTMLMediaElement/play)；仅参考状态检测思路，未复制实现或引入依赖，没有采用其跳过缓冲间隙或移动播放位置的做法。
 
 只查阅这些来源不能构成全面的知识产权检索或法律保证。MIT 许可仅覆盖本项目有权许可的内容，不赋予平台服务、商标或第三方素材的权利。
 

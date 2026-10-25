@@ -17,8 +17,10 @@ function harness(options={}) {
     tabs:{onActivated:{addListener(){}},onRemoved:{addListener(){}},query:async()=>[{id:7}]},
     permissions:{contains:options.permission|| (async()=>true)},
     storage:{local:storage(local),session:storage(session,options.beforeSessionSet)}};
-  const sandbox={chrome,URL,AbortController,setTimeout,clearTimeout,crypto:webcrypto,console,
-    fetch:async(url,init)=>{calls.push({url,init});return {ok:options.httpStatus===undefined,status:options.httpStatus,json:async()=>({choices:[{message:{content:JSON.stringify(options.answer || {answers:['A']})}}]})};}};
+  const sandbox={chrome,URL,AbortController,setTimeout:options.setTimeout||setTimeout,clearTimeout,crypto:webcrypto,console,
+    fetch:async(url,init)=>{calls.push({url,init});if(options.fetch)return options.fetch(url,init);const status=options.httpStatus??200;return {ok:status>=200&&status<300,status,
+      headers:{get:name=>name.toLowerCase()==='retry-after'?(options.retryAfter??null):null},
+      json:async()=>Object.hasOwn(options,'payload')?options.payload:{choices:[{message:{content:JSON.stringify(options.answer || {answers:['A']})}}]}};}};
   vm.createContext(sandbox);
   sandbox.importScripts=name=>vm.runInContext(fs.readFileSync(path.join(__dirname,'../extension',name),'utf8'),sandbox);
   vm.runInContext(fs.readFileSync(path.join(__dirname,'../extension/background.js'),'utf8'),sandbox);
@@ -72,4 +74,53 @@ test('a slow start storage write cannot overwrite a later stop',async()=>{
 });
 test('HTTP errors report status without including response bodies or credentials',async()=>{
   const h=harness({httpStatus:401});await ready(h);const r=await h.send({type:'SOLVE',question});assert.match(r.error,/HTTP 401/);assert.equal(r.error.includes(config.apiKey),false);
+});
+
+test('only transient HTTP failures are eligible for a course retry',async()=>{
+  for(const status of [408,429,500,502,503,504,400,401,403,404,422,501,505]){
+    const h=harness({httpStatus:status});await ready(h);const r=await h.send({type:'SOLVE',question});
+    assert.equal(r.ok,false);assert.equal(r.retryable,[408,429,500,502,503,504].includes(status),`HTTP ${status}`);assert.equal(h.calls.length,1);
+  }
+});
+
+test('retry metadata respects seconds and HTTP-date Retry-After values',async()=>{
+  for(const [header,min,max] of [['12',12000,12000],[new Date(Date.now()+120000).toUTCString(),118000,120000],['invalid',0,0],['-1',0,0]]){
+    const h=harness({httpStatus:429,retryAfter:header});await ready(h);const r=await h.send({type:'SOLVE',question});
+    assert.equal(r.retryable,true);assert.ok(r.retryAfterMs>=min&&r.retryAfterMs<=max,`${header}: ${r.retryAfterMs}`);
+  }
+});
+
+test('server waits longer than five minutes stop instead of retrying early',async()=>{
+  const h=harness({httpStatus:429,retryAfter:'3600'});await ready(h);const r=await h.send({type:'SOLVE',question});
+  assert.equal(r.retryable,false);assert.match(r.error,/5 分钟/);assert.equal(h.calls.length,1);
+});
+
+test('fetch connection failures are retryable without exposing the raw error',async()=>{
+  const h=harness({fetch:async()=>{throw new TypeError('private-transport-detail');}});await ready(h);const r=await h.send({type:'SOLVE',question});
+  assert.equal(r.retryable,true);assert.match(r.error,/网络/);assert.doesNotMatch(r.error,/private-transport-detail/);
+});
+
+test('an interrupted response can retry but invalid response JSON cannot',async()=>{
+  for(const [failure,retryable] of [[new TypeError('private-body-detail'),true],[new SyntaxError('private-body-detail'),false]]){
+    const h=harness({fetch:async()=>({ok:true,json:async()=>{throw failure;}})});await ready(h);const r=await h.send({type:'SOLVE',question});
+    assert.equal(r.retryable,retryable);assert.doesNotMatch(r.error,/private-body-detail/);
+  }
+});
+
+const interruptedFetch=(_url,init)=>new Promise((_resolve,reject)=>init.signal.addEventListener('abort',()=>reject(Error('aborted')),{once:true}));
+test('a request timeout is retryable',async()=>{
+  const h=harness({fetch:interruptedFetch,setTimeout:(fn,ms)=>setTimeout(fn,ms===25000?5:ms)});await ready(h);const r=await h.send({type:'SOLVE',question});
+  assert.equal(r.retryable,true);assert.match(r.error,/25 秒/);assert.equal(h.calls[0].init.signal.aborted,true);
+});
+
+test('a manually cancelled request is never retryable',async()=>{
+  const h=harness({fetch:interruptedFetch});await ready(h);const solve=h.send({type:'SOLVE',question});
+  await new Promise(r=>setImmediate(r));assert.equal(h.calls.length,1);await h.send({type:'CANCEL'});const r=await solve;
+  assert.equal(r.retryable,false);assert.match(r.error,/取消/);assert.equal(h.calls[0].init.signal.aborted,true);
+});
+
+test('invalid response data and invalid answers are not network retries',async()=>{
+  for(const options of [{payload:null},{payload:{}},{payload:{choices:[{message:{content:'not JSON'}}]}},{answer:{answers:['Z']}}]){
+    const h=harness(options);await ready(h);const r=await h.send({type:'SOLVE',question});assert.equal(r.ok,false);assert.equal(r.retryable,false);assert.equal(h.calls.length,1);
+  }
 });

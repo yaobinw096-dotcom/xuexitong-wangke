@@ -4,8 +4,12 @@
   const K = Keban, $ = (s, d = document) => d.querySelector(s), $$ = (s, d = document) => [...d.querySelectorAll(s)];
   const pause = ms => new Promise(r => setTimeout(r, ms));
   const state = {running: false, starting: false, busy: false, epoch: 0, route: '', doc: null, course: '', message: '准备就绪', logs: [], answers: [], completed: 0};
-  let cfg = {...K.defaults}, activeMedia = null, done = new WeakSet(), endWait = new WeakMap(), emptySince = 0;
-  async function send(message) { const r = await chrome.runtime.sendMessage(message); if (!r?.ok) throw Error(r?.error || '插件后台未响应，请刷新页面'); return r.data; }
+  let cfg = {...K.defaults}, activeMedia = null, done = new WeakSet(), endWait = new WeakMap(), mediaWatches = new WeakMap(), emptySince = 0;
+  async function send(message) {
+    const r = await chrome.runtime.sendMessage(message);
+    if (!r?.ok) throw Object.assign(Error(r?.error || '插件后台未响应，请刷新页面'), {retryable: r?.retryable === true, retryAfterMs: r?.retryAfterMs || 0});
+    return r.data;
+  }
   function courseId() { const p = new URL(location.href).searchParams; return `${location.origin}:${p.get('courseId') || p.get('courseid') || ''}:${p.get('clazzid') || ''}`; }
   function visible(el) {
     if (!el?.isConnected) return false;
@@ -33,7 +37,7 @@
       state.route = route(); state.doc = base(); state.course = courseId();
       await send({type: 'SET_RUN', enabled: true, courseId: state.course});
       if (epoch !== state.epoch) { await send({type: 'SET_RUN', enabled: false, courseId: state.course}); return; }
-      waitStarted = emptySince = 0; state.running = true; note('正在识别当前章节');
+      waitStarted = emptySince = 0; mediaWatches = new WeakMap(); state.running = true; note('正在识别当前章节');
     } finally { state.starting = false; render(); }
   }
   function docs(root, chain = [], out = []) {
@@ -196,9 +200,25 @@
   async function solve(q, chain, t) {
     if (!cfg.hasAI) throw Error('先打开设置，填写 AI 接口和模型名称');
     const image = await imageFor(q, chain, t);
-    const result = K.answer(await send({type: 'SOLVE', question: q.data, image}), q.data);
-    check(t, q.el);
-    if (parseQuestion(q.el, q.index, q.video).signature !== q.signature) throw Error('题目内容已变化，已丢弃旧答案');
+    function currentQuestion() {
+      check(t, q.el);
+      if (parseQuestion(q.el, q.index, q.video).signature !== q.signature) throw Error('题目内容已变化，已丢弃旧答案');
+    }
+    const delays = [3000, 8000, 15000]; let result;
+    for (let attempt = 0; ; attempt++) {
+      currentQuestion();
+      try { result = K.answer(await send({type: 'SOLVE', question: q.data, image}), q.data); break; }
+      catch (e) {
+        currentQuestion();
+        if (!e.retryable) throw e;
+        if (attempt === delays.length) throw Error(`AI 请求自动重试 ${delays.length} 次仍失败：${e.message}`);
+        const delay = Math.max(delays[attempt], e.retryAfterMs), deadline = Date.now() + delay;
+        note(`${e.message}；${Math.ceil(delay / 1000)} 秒后自动重试 ${attempt + 1}/${delays.length}`);
+        while (Date.now() < deadline) { await pause(Math.min(250, deadline - Date.now())); check(t, q.el); }
+        note(`正在重试 AI 请求 ${attempt + 1}/${delays.length}`);
+      }
+    }
+    currentQuestion();
     fill(q, result); await pause(250); check(t, q.el);
     if (!verify(q, result)) throw Error('页面回读与答案不一致，已暂停，未提交');
     state.answers.push({question: q.data.text.slice(0, 120), answer: result.answers.join(' / '), explanation: result.explanation});
@@ -244,10 +264,54 @@
     if (!cfg.autoSubmit) { await stop('已填写全部答案，请检查后手动提交'); return; }
     await submitQuiz(job, answered, t); check(t); done.add(job.frame || job.doc); state.completed++; note('章节测验已确认提交');
   }
+  const recoveryStorage = 'keban-media-recovery';
+  function mediaKey() { const p = new URL(location.href).searchParams; return `${courseId()}|${p.get('chapterId') || p.get('chapterid') || ''}`; }
+  function playMedia(el, watch) {
+    const request = {}; watch.request = request; watch.error = null; watch.playAfter = Date.now() + 3000;
+    // Never hold tick() busy while the browser's play promise is pending.
+    try {
+      Promise.resolve(el.play()).then(() => { if (watch.request === request) watch.request = null; }, e => {
+        if (watch.request === request) { watch.request = null; watch.error = e.name; }
+      });
+    } catch (e) { watch.request = null; watch.error = e.name; }
+  }
+  function checkMediaRefresh(job, t) {
+    check(t, job.media);
+    for (const {doc} of docs(base())) if ($$('.ans-videoquiz', doc).some(visible)) throw Error('视频题目尚未处理，已取消自动刷新');
+    const jobs = tasks(); if (!jobs) throw Error('章节正在变化，已取消自动刷新');
+    for (const item of jobs.filter(j => j.kind === 'quiz')) {
+      for (const q of questions(item.doc)) {
+        const written = q.options.some(selected) || q.fields.some(field => {
+          const {input, editable, bodies} = fieldParts(field);
+          return [input?.value, editable?.textContent, ...bodies.map(b => b.textContent)].some(v => K.normalize(v || ''));
+        });
+        if (written) throw Error('本节有未提交答案，已取消自动刷新，请先保存或提交');
+      }
+    }
+  }
+  async function refreshMedia(job, t) {
+    checkMediaRefresh(job, t);
+    const key = mediaKey(); let saved;
+    try { saved = JSON.parse(sessionStorage.getItem(recoveryStorage) || 'null'); }
+    catch { throw Error('无法读取视频恢复次数，请手动刷新页面'); }
+    if (saved && (!Number.isInteger(saved.count) || saved.count < 0 || saved.count > 2)) throw Error('视频恢复记录异常，请手动刷新页面');
+    const count = saved?.key === key ? saved.count : 0;
+    if (count >= 2) throw Error('视频自动刷新 2 次后仍停滞，请检查网络或播放器');
+    const position = job.media.currentTime;
+    note(`视频持续停滞，即将刷新当前章节并继续（${count + 1}/2）`);
+    await pause(1500); checkMediaRefresh(job, t);
+    if (job.media.ended || taskDone(job.frame) || Math.abs(job.media.currentTime - position) > 0.05) return;
+    try { sessionStorage.setItem(recoveryStorage, JSON.stringify({key, count: count + 1})); }
+    catch { throw Error('无法保存视频恢复次数，已取消自动刷新'); }
+    // GET_RUN remains enabled so the reloaded chapter resumes; the persisted cap prevents a reload loop.
+    state.running = false; state.epoch++;
+    try { location.reload(); } catch { await stop('自动刷新失败，请手动刷新页面'); }
+  }
   async function media(job, t) {
     const el = job.media; activeMedia = el;
     const videoQuiz = $('.ans-videoquiz', job.doc);
     if (visible(videoQuiz) && $('.tkTopic', videoQuiz)) {
+      mediaWatches.delete(el);
       if (!cfg.autoAnswer) throw Error('视频出现题目，请手动回答后继续');
       note('正在处理视频弹题'); const q = parseQuestion(videoQuiz, 0, true);
       await solve(q, job.chain, t); check(t);
@@ -271,9 +335,30 @@
       done.add(el); state.completed++; note('视频播放结束'); return;
     }
     el.muted = cfg.muted; if (Math.abs(el.playbackRate - cfg.rate) > 0.01) el.playbackRate = cfg.rate;
-    if (el.error) throw Error('视频加载出错，请先在页面重试');
-    if (el.paused) { check(t); try { await el.play(); } catch { throw Error('浏览器阻止自动播放，请点击页面播放按钮后继续'); } }
-    check(t); note(`播放中 · ${Math.floor(el.currentTime)} / ${Number.isFinite(el.duration) ? Math.floor(el.duration) : '--'} 秒`);
+    check(t, el);
+    const now = Date.now();
+    if (!mediaWatches.has(el)) mediaWatches.set(el, {time: el.currentTime, progressAt: now, retryAt: 0, attempts: 0, stableSince: 0, playAfter: 0, request: null, error: null});
+    const watch = mediaWatches.get(el);
+    if (Math.abs(el.currentTime - watch.time) > 0.05) {
+      watch.time = el.currentTime; watch.progressAt = now;
+      if (!watch.stableSince) watch.stableSince = now;
+      if (now - watch.stableSince >= 30000) {
+        watch.attempts = 0;
+        try { const saved = JSON.parse(sessionStorage.getItem(recoveryStorage) || 'null'); if (saved?.key === mediaKey()) sessionStorage.removeItem(recoveryStorage); } catch {}
+      }
+    } else if (now - watch.progressAt > 3000) watch.stableSince = 0;
+    if (watch.error === 'NotAllowedError') throw Error('浏览器阻止自动播放，请点击页面播放按钮后继续');
+    if (watch.error === 'NotSupportedError' || [3, 4].includes(el.error?.code)) throw Error('视频格式不支持或解码失败，请先在页面检查');
+    const stalled = now - watch.progressAt;
+    if (stalled >= 15000 && now >= watch.retryAt) {
+      if (watch.attempts >= 2) { await refreshMedia(job, t); return; }
+      watch.attempts++; watch.retryAt = now + 15000; watch.request = null;
+      el.pause(); check(t, el); playMedia(el, watch);
+      note(`视频进度停滞，正在恢复播放 ${watch.attempts}/2`); return;
+    }
+    if (el.paused && !watch.request && now >= watch.playAfter) playMedia(el, watch);
+    const progress = `${Math.floor(el.currentTime)} / ${Number.isFinite(el.duration) ? Math.floor(el.duration) : '--'} 秒`;
+    note(stalled >= 3000 ? `视频缓冲或停滞 ${Math.floor(stalled / 1000)} 秒 · ${progress}` : `播放中 · ${progress}`);
   }
   async function next(t) {
     if (!cfg.autoNext) { await stop('本节已处理，自动切章已关闭'); return; }
@@ -294,7 +379,7 @@
     const t = token();
     try {
       if (state.course !== courseId()) { await stop('已切换到另一门课程，请手动开始'); return; }
-      if (state.route !== t.route || state.doc !== t.doc) { state.route = t.route; state.doc = t.doc; state.epoch++; done = new WeakSet(); endWait = new WeakMap(); waitStarted = 0; emptySince = 0; return; }
+      if (state.route !== t.route || state.doc !== t.doc) { state.route = t.route; state.doc = t.doc; state.epoch++; done = new WeakSet(); endWait = new WeakMap(); mediaWatches = new WeakMap(); waitStarted = 0; emptySince = 0; return; }
       const jobs = tasks();
       if (!jobs) { if (!waitStarted) waitStarted = Date.now(); if (Date.now() - waitStarted > 30000) throw Error('课程 iframe 加载超时或跨域无法读取，请手动检查'); note('等待课程 iframe 加载'); return; }
       const job = jobs.find(j => j.kind !== 'done' && !done.has(j.media || j.frame || j.doc || j.root));

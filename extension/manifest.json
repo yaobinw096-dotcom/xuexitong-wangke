@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "课伴 · 学习通助手",
-  "version": "0.1.3",
-  "version_name": "0.1.3-alpha.1",
+  "version": "0.1.4",
+  "version_name": "0.1.4-alpha.2",
   "minimum_chrome_version": "114",
   "description": "自动播放和切换学习通章节，使用你配置的 AI 接口填写章节测验。",
   "permissions": ["storage", "activeTab"],

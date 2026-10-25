@@ -9,7 +9,7 @@ fs.mkdirSync(runDir, {recursive:true}); copyTree(path.join(root,'extension'), ex
 const manifest = JSON.parse(fs.readFileSync(path.join(extension,'manifest.json')));
 // Test copy only: pre-grant capture and loopback access because the headless browser has no permission dialog UI.
 manifest.host_permissions = ['<all_urls>']; fs.writeFileSync(path.join(extension,'manifest.json'), JSON.stringify(manifest,null,2));
-let apiMode = 'normal', delayMs = 0, requests = [], context, worker, options, server, browserVersion;
+let apiMode = 'normal', delayMs = 0, requests = [], apiFailures = [], context, worker, options, server, browserVersion;
 const results = [], errors = [];
 const origin = 'http://mooc1.chaoxing.com';
 const css = 'body{font:16px sans-serif;margin:16px;color:#253f35}iframe{width:100%;border:0;height:700px}button{padding:8px 20px;margin:8px}.singleQuesId{padding:14px;border-bottom:1px solid #ddd}.before-after,.before-after-checkbox{padding:6px;cursor:pointer}.check_answer,.check_answer_dx{background:#b8e4c7}textarea{width:90%;height:55px}';
@@ -59,6 +59,8 @@ async function fixture(route) {
   } else if(url.pathname==='/chapter') {
     const video=url.searchParams.get('part')==='video';
     body=html(`<div class="ans-attach-ct"><span class="ans-job-icon"></span><iframe src="/ananas/modules/${video?'video':'work'}/index.html?case=${mode}"></iframe></div>`);
+  } else if(url.pathname.includes('/ananas/modules/video/') && mode.startsWith('video-stall')) {
+    body=html('<video controls></video>');
   } else if(url.pathname.includes('/ananas/modules/video/')) {
     const popup=mode==='video'?'':`<div class="ans-videoquiz"><p class="tkTopic">单选题：测试弹题</p><label class="ans-videoquiz-opt"><input type="radio" name="ans-videoquiz-opt">选项一</label><label class="ans-videoquiz-opt"><input type="radio" name="ans-videoquiz-opt">选项二</label><button id="videoquiz-submit">提交</button><span id="spanNot" style="display:none">错误</span><span id="spanNotBackPoint" style="display:none">错误</span><button id="videoquiz-continue" style="display:none">继续</button></div><script>window.popupSubmits=0;window.popupContinues=0;document.querySelector('#videoquiz-submit').onclick=()=>{window.popupSubmits++;if(${JSON.stringify(mode)}==='video-error'){document.querySelector('#spanNotBackPoint').style.display='block';document.querySelector('#videoquiz-continue').style.display='block'}};document.querySelector('#videoquiz-continue').onclick=()=>{window.popupContinues++;document.querySelector('.ans-videoquiz').style.display='none'};</script>`;
     body=html('<video controls src="/one-second.wav"></video>'+popup+'<script>window.played=0;const v=document.querySelector("video");v.onplay=()=>window.played++;v.onended=()=>frameElement.parentElement.classList.add("ans-job-finished")</script>');
@@ -83,18 +85,46 @@ async function openCourse(mode, overrides={}) {
   const id=await worker.evaluate(async url=>(await chrome.tabs.query({})).find(t=>t.url===url)?.id,page.url());assert.ok(id);
   const command=type=>worker.evaluate(async ({id,type})=>chrome.tabs.sendMessage(id,{type},{frameId:0}),{id,type});
   const status=async()=>(await command('STATUS')).data;
-  const stopped=()=>until(async()=>{const s=await status();return !s.running?s:false;},23000);
+  const stopped=(timeout=23000)=>until(async()=>{const s=await status();return !s.running?s:false;},timeout);
   const started=await command('START');assert.equal(started.ok,true,started.error);
   const quizFrame=()=>page.frames().find(f=>f.url().includes('/modules/work/'));
   return {page,id,command,status,stopped,quizFrame};
 }
-function report(completed=false) {fs.writeFileSync(path.join(artifacts,'browser-results.json'),JSON.stringify({completed,browser:browserVersion,results,errors},null,2));}
-async function record(name, fn) {const t=Date.now();await fn();results.push({name,passed:true,ms:Date.now()-t});console.log(`PASS ${name}`);report();}
+// Inject media failures in the extension's isolated world; production code is unchanged.
+async function mediaFault(c, mode='stuck') {
+  const client=await context.newCDPSession(c.page), worlds=[];
+  client.on('Runtime.executionContextCreated',({context:world})=>worlds.push(world));
+  await client.send('Runtime.enable');
+  const {frameTree}=await client.send('Page.getFrameTree');
+  const extensionId=new URL(worker.url()).host;
+  const world=worlds.find(w=>w.auxData?.frameId===frameTree.frame.id && w.origin===`chrome-extension://${extensionId}`);
+  assert.ok(world,`extension isolated world must exist: ${JSON.stringify(worlds)}`);
+  const evaluate=async expression=>{
+    const r=await client.send('Runtime.evaluate',{contextId:world.id,expression,returnByValue:true,awaitPromise:true});
+    if(r.exceptionDetails)throw Error(r.exceptionDetails.text+': '+r.exceptionDetails.exception?.description);
+    return r.result.value;
+  };
+  await until(()=>evaluate('Boolean(document.querySelector("#iframe")?.contentDocument?.querySelector("iframe")?.contentDocument?.querySelector("video"))'));
+  await evaluate(`(()=>{
+    const v=document.querySelector('#iframe').contentDocument.querySelector('iframe').contentDocument.querySelector('video');
+    const realNow=Date.now.bind(Date);globalThis.mediaTest={offset:0,time:680,paused:${mode==='pending'},plays:0,pauses:0,seeks:0};
+    const f=mediaTest;Date.now=()=>realNow()+f.offset;
+    Object.defineProperties(v,{currentTime:{get:()=>f.time,set:()=>f.seeks++},duration:{get:()=>1074},paused:{get:()=>f.paused},ended:{get:()=>false},error:{get:()=>null},readyState:{get:()=>2}});
+    v.pause=()=>{f.paused=true;f.pauses++};
+    v.play=()=>{f.plays++;f.paused=false;if(${JSON.stringify(mode)}==='recover')f.time++;return ${mode==='pending'?'new Promise(()=>{})':'Promise.resolve()'}};
+  })()`);
+  return {evaluate,advance:()=>evaluate('mediaTest.offset+=16000'),stats:()=>evaluate('({...mediaTest})'),close:()=>client.detach()};
+}
+function report(completed=false) {fs.writeFileSync(path.join(artifacts,'browser-results.json'),JSON.stringify({completed,filter:process.env.KEBAN_TEST_FILTER||null,browser:browserVersion,results,errors},null,2));}
+async function record(name, fn) {if(process.env.KEBAN_TEST_FILTER&&!name.includes(process.env.KEBAN_TEST_FILTER))return;const t=Date.now();await fn();results.push({name,passed:true,ms:Date.now()-t});console.log(`PASS ${name}`);report();}
 (async()=>{
   server=http.createServer(async(req,res)=>{
     let text='';for await(const chunk of req)text+=chunk;const data=JSON.parse(text);const user=data.messages.at(-1).content;
     const textPart=typeof user==='string'?user:user[0].text;const q=JSON.parse(textPart.slice(textPart.indexOf('{')));
-    const call={q,body:data,headers:req.headers,aborted:false};requests.push(call);res.on('close',()=>{if(!res.writableEnded)call.aborted=true;});
+    const call={q,body:data,headers:req.headers,aborted:false,time:Date.now()};requests.push(call);res.on('close',()=>{if(!res.writableEnded)call.aborted=true;});
+    const failure=apiFailures.shift();
+    if(failure?.hang)return;
+    if(failure){res.writeHead(failure.status,{'Content-Type':'application/json',...(failure.after?{'Retry-After':failure.after}:{})});res.end('{"error":"synthetic temporary failure"}');return;}
     const mode=apiMode;await wait(delayMs);
     const answers=q.type==='multiple'?['A','C']:q.type==='blank'?['第一空','第二空']:q.type==='short'?['合成简答内容 <安全文本>']:['A'];
     const reply=mode==='malformed'?'not JSON':JSON.stringify({answers:mode==='invalid-option'?['Z']:answers,...(mode==='low'?{confidence:.2}:{}),explanation:'本地固定测试答案'});
@@ -123,6 +153,46 @@ async function record(name, fn) {const t=Date.now();await fn();results.push({nam
     assert.equal(await options.locator('#apiBase').inputValue(),before.apiBase);assert.equal(await options.locator('#apiKey').inputValue(),before.apiKey);
     await options.locator('#save').click();await until(async()=>(await options.locator('#status').innerText()).startsWith('已保存'));
     assert.deepEqual(await worker.evaluate(async()=>(await chrome.storage.local.get('settings')).settings),before);
+  });
+  await record('Temporary API failures recover and the quiz submits only once',async()=>{
+    requests=[];apiFailures=[{status:503},{status:503}];const c=await openCourse('retry-recover');
+    await until(async()=>(await c.status()).message.includes('自动重试 1/3'));
+    assert.equal((await c.status()).running,true);assert.equal(await c.quizFrame().evaluate(()=>window.submitClicks),0);
+    const s=await c.stopped();assert.match(s.message,/没有下一节/);assert.equal(requests.length,3);
+    assert.ok(requests[1].time-requests[0].time>=2900);assert.ok(requests[2].time-requests[1].time>=7900);
+    assert.equal(await c.quizFrame().evaluate(()=>window.submissions),1);assert.equal(await c.quizFrame().evaluate(()=>window.submitClicks),1);await c.page.close();
+  });
+  await record('A real 25-second API timeout retries and recovers',async()=>{
+    requests=[];apiFailures=[{hang:true}];const c=await openCourse('retry-timeout');const s=await c.stopped(40000);
+    assert.match(s.message,/没有下一节/);assert.equal(requests.length,2);assert.equal(requests[0].aborted,true);
+    assert.equal(await c.quizFrame().evaluate(()=>window.submissions),1);await c.page.close();
+  });
+  await record('Rate limiting waits for Retry-After before recovering',async()=>{
+    requests=[];apiFailures=[{status:429,after:'5'}];const c=await openCourse('retry-after');const s=await c.stopped();
+    assert.match(s.message,/没有下一节/);assert.equal(requests.length,2);assert.ok(requests[1].time-requests[0].time>=4900);
+    assert.equal(await c.quizFrame().evaluate(()=>window.submissions),1);await c.page.close();
+  });
+  await record('Persistent API failure stops after three retries without submitting',async()=>{
+    requests=[];apiFailures=Array.from({length:4},()=>({status:503}));const c=await openCourse('retry-exhausted');const s=await c.stopped(40000);
+    assert.match(s.message,/自动重试 3 次仍失败/);assert.equal(requests.length,4);assert.equal(await c.quizFrame().locator('.check_answer').count(),0);
+    assert.equal(await c.quizFrame().evaluate(()=>window.submitClicks),0);await c.page.close();
+  });
+  await record('Authentication errors stop after one request',async()=>{
+    requests=[];apiFailures=[{status:401}];const c=await openCourse('retry-auth');const s=await c.stopped();
+    assert.match(s.message,/HTTP 401/);assert.equal(requests.length,1);assert.equal(await c.quizFrame().evaluate(()=>window.submitClicks),0);await c.page.close();
+  });
+  await record('Manual pause during retry backoff prevents another request',async()=>{
+    requests=[];apiFailures=[{status:503}];const c=await openCourse('retry-stop');await until(async()=>(await c.status()).message.includes('自动重试 1/3'));
+    await c.command('STOP');await wait(3600);assert.equal((await c.status()).running,false);assert.equal(requests.length,1);
+    assert.equal(await c.quizFrame().evaluate(()=>window.submitClicks),0);await c.page.close();
+  });
+  for(const change of ['question','frame','course'])await record(`${change} changes during backoff abandon the pending retry`,async()=>{
+    requests=[];apiFailures=[{status:503}];const c=await openCourse(`retry-stale-${change}`);await until(async()=>(await c.status()).message.includes('自动重试 1/3'));
+    if(change==='question')await c.quizFrame().locator('.Zy_TItle').evaluate(el=>el.textContent='等待期间题目发生变化');
+    else if(change==='frame')await c.quizFrame().evaluate(()=>location.reload());
+    else await c.page.evaluate(()=>history.pushState({},'',location.href.replace('courseId=fixture','courseId=another')));
+    const s=await c.stopped();assert.match(s.message,change==='question'?/题目内容已变化/:change==='frame'?/页面已变化/:/另一门课程/);
+    await wait(3200);assert.equal(requests.length,1);assert.equal(await c.quizFrame().evaluate(()=>window.submitClicks),0);await c.page.close();
   });
   await record('Quiz result navigation proceeds to the next chapter without pausing or resubmitting',async()=>{
     requests=[];const c=await openCourse('submit-navigation');const s=await c.stopped();assert.match(s.message,/没有下一节/);
@@ -175,6 +245,88 @@ async function record(name, fn) {const t=Date.now();await fn();results.push({nam
   });
   await record('A real HTML media end triggers next chapter then quiz submission',async()=>{
     const c=await openCourse('video');const s=await c.stopped();assert.match(s.message,/没有下一节/);assert.equal(await c.page.evaluate(()=>window.nextClicks),1);assert.equal(await c.quizFrame().evaluate(()=>window.submissions),1);await c.page.close();
+  });
+  await record('Video stall: unpaused frozen progress triggers a real 15-second recovery without seeking',async()=>{
+    const c=await openCourse('video-stall-recover'),f=await mediaFault(c,'recover');
+    const start=Date.now();await until(async()=>(await f.stats()).plays===1,21000);
+    assert.ok(Date.now()-start>=14000);assert.equal((await f.stats()).pauses,1);assert.equal((await f.stats()).seeks,0);
+    await until(async()=>(await c.status()).message.includes('681 / 1074'));
+    assert.equal((await c.status()).running,true);assert.equal(await c.page.evaluate(()=>window.nextClicks),0);
+    await f.close();await c.page.close();
+  });
+  await record('Video stall: a pending play promise does not block detection or pause and restart',async()=>{
+    const c=await openCourse('video-stall-pending'),f=await mediaFault(c,'pending');
+    await until(async()=>(await f.stats()).plays===1);await f.advance();
+    await until(async()=>(await f.stats()).plays===2);await c.command('STOP');
+    assert.equal((await c.status()).running,false);await c.command('START');
+    await until(async()=>(await f.stats()).plays===3);assert.equal((await c.status()).running,true);
+    assert.equal((await f.stats()).seeks,0);await f.close();await c.page.close();
+  });
+  await record('Video stall: two bounded page reloads resume the session then persistent failure stops',async()=>{
+    const c=await openCourse('video-stall-refresh');
+    for(let load=0;load<3;load++){
+      const f=await mediaFault(c);await until(async()=>(await c.status()).message.includes('680 / 1074'));
+      for(let attempt=1;attempt<=2;attempt++){await f.advance();await until(async()=>(await f.stats()).plays===attempt);}
+      assert.equal((await f.stats()).seeks,0);await f.advance();
+      if(load<2){
+        await until(async()=>(await c.status()).message.includes('即将刷新当前章节'));
+        await c.page.waitForEvent('domcontentloaded');await c.page.locator('#keban-assistant').waitFor();
+        await until(async()=>(await c.status()).running);await f.close();
+      }else{
+        const s=await c.stopped();assert.match(s.message,/自动刷新 2 次后仍停滞/);await f.close();
+      }
+    }
+    assert.equal(await c.page.evaluate(()=>window.nextClicks),0);await c.page.close();
+  });
+  await record('Video stall: pausing during the reload notice cancels the refresh',async()=>{
+    const c=await openCourse('video-stall-pause'),f=await mediaFault(c);let navigations=0;c.page.on('domcontentloaded',()=>navigations++);
+    await until(async()=>(await c.status()).message.includes('680 / 1074'));
+    for(let attempt=1;attempt<=2;attempt++){await f.advance();await until(async()=>(await f.stats()).plays===attempt);}
+    await f.advance();await until(async()=>(await c.status()).message.includes('即将刷新当前章节'));
+    await c.command('STOP');await wait(2200);assert.equal(navigations,0);assert.equal((await c.status()).running,false);
+    await f.close();await c.page.close();
+  });
+  await record('Video stall: a changing media iframe cancels a scheduled page reload',async()=>{
+    const c=await openCourse('video-stall-frame'),f=await mediaFault(c);let navigations=0;c.page.on('domcontentloaded',()=>navigations++);
+    await until(async()=>(await c.status()).message.includes('680 / 1074'));
+    for(let attempt=1;attempt<=2;attempt++){await f.advance();await until(async()=>(await f.stats()).plays===attempt);}
+    await f.advance();await until(async()=>(await c.status()).message.includes('即将刷新当前章节'));
+    await c.page.frames().find(frame=>frame.url().includes('/modules/video/')).evaluate(()=>location.reload());
+    await wait(2200);assert.equal(navigations,0);assert.equal((await c.status()).running,false);await f.close();await c.page.close();
+  });
+  await record('Video stall: unsubmitted quiz answers prevent an automatic page reload',async()=>{
+    const c=await openCourse('video-stall-unsaved'),f=await mediaFault(c);let navigations=0;c.page.on('domcontentloaded',()=>navigations++);
+    const chapter=c.page.frames().find(frame=>frame.url().includes('/chapter?'));
+    await chapter.evaluate(()=>{const box=document.createElement('div');box.className='ans-attach-ct';box.innerHTML='<iframe src="/ananas/modules/work/index.html?case=single"></iframe>';document.body.appendChild(box)});
+    await until(()=>c.quizFrame());await c.quizFrame().locator('.before-after').first().click();
+    await until(async()=>(await c.status()).message.includes('680 / 1074'));
+    for(let attempt=1;attempt<=2;attempt++){await f.advance();await until(async()=>(await f.stats()).plays===attempt);}
+    await f.advance();const s=await c.stopped();assert.match(s.message,/有未提交答案/);
+    assert.equal(navigations,0);assert.equal(await c.quizFrame().locator('.check_answer').count(),1);assert.equal(await c.quizFrame().evaluate(()=>window.submitClicks),0);
+    await f.close();await c.page.close();
+  });
+  await record('Video stall: recovered progress during the notice cancels the page reload',async()=>{
+    const c=await openCourse('video-stall-late-recover'),f=await mediaFault(c);let navigations=0;c.page.on('domcontentloaded',()=>navigations++);
+    await until(async()=>(await c.status()).message.includes('680 / 1074'));
+    for(let attempt=1;attempt<=2;attempt++){await f.advance();await until(async()=>(await f.stats()).plays===attempt);}
+    await f.advance();await until(async()=>(await c.status()).message.includes('即将刷新当前章节'));
+    await f.evaluate('mediaTest.time++');await wait(2200);assert.equal(navigations,0);assert.equal((await c.status()).running,true);
+    assert.equal(await c.page.evaluate(()=>sessionStorage.getItem('keban-media-recovery')),null);await f.close();await c.page.close();
+  });
+  await record('Video stall: normal progress avoids recovery and clears the reload cap after 30 seconds',async()=>{
+    const c=await openCourse('video-stall-progress'),f=await mediaFault(c);
+    await c.page.evaluate(()=>sessionStorage.setItem('keban-media-recovery',JSON.stringify({key:location.origin+':fixture:class|',count:2})));
+    await until(async()=>(await c.status()).message.includes('680 / 1074'));
+    for(let i=1;i<=4;i++){await f.evaluate('mediaTest.offset+=16000;mediaTest.time++');await until(async()=>(await c.status()).message.includes(`${680+i} / 1074`));}
+    assert.equal((await f.stats()).plays,0);assert.equal((await f.stats()).seeks,0);
+    assert.equal(await c.page.evaluate(()=>sessionStorage.getItem('keban-media-recovery')),null);await f.close();await c.page.close();
+  });
+  await record('Video stall: unavailable session storage stops instead of an unbounded reload loop',async()=>{
+    const c=await openCourse('video-stall-storage'),f=await mediaFault(c);let navigations=0;c.page.on('domcontentloaded',()=>navigations++);
+    await f.evaluate('void Object.defineProperty(window,"sessionStorage",{get(){throw Error("storage blocked")}})');
+    await until(async()=>(await c.status()).message.includes('680 / 1074'));
+    for(let attempt=1;attempt<=2;attempt++){await f.advance();await until(async()=>(await f.stats()).plays===attempt);}
+    await f.advance();const s=await c.stopped();assert.match(s.message,/无法读取视频恢复次数/);assert.equal(navigations,0);await f.close();await c.page.close();
   });
   await record('Visible image question is cropped and sent as image content',async()=>{
     requests=[];const c=await openCourse('image');await c.page.bringToFront();const s=await c.stopped();assert.match(s.message,/没有下一节/);assert.match(requests[0].body.messages.at(-1).content[1].image_url.url,/^data:image\/jpeg;base64,/);await c.page.close();
